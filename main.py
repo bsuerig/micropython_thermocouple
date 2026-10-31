@@ -50,11 +50,15 @@ class Device:
         self.lan = lan
         self.sensor = sensor
         self.temperature = None
-        self.sensor_status = "Noch keine Messung"
+        self.sensor_status = "Not sampled yet"
         self.client = None
-        self.mqtt_status = "deaktiviert"
-        if config["mqtt_server"]:
-            self.mqtt_status = "getrennt" if MQTTClient else "umqtt.simple fehlt"
+        self.mqtt_status = "Disabled"
+        self.mqtt_enabled = config.get("mqtt_enabled", bool(config.get("mqtt_server")))
+        if self.mqtt_enabled:
+            if config["mqtt_server"]:
+                self.mqtt_status = "Disconnected" if MQTTClient else "MQTT library missing"
+            else:
+                self.mqtt_status = "Broker not configured"
         self.last_sample = time.ticks_add(time.ticks_ms(), -1000)
         self.last_publish = time.ticks_ms()
         self.last_connect = time.ticks_add(time.ticks_ms(), -MQTT_RETRY_MS)
@@ -62,8 +66,10 @@ class Device:
 
     def status(self):
         """Return only public runtime data, never broker credentials."""
-        return {"ip": self.lan.ifconfig()[0], "temperature": self.temperature,
-                "sensor": self.sensor_status, "mqtt": self.mqtt_status}
+        mac = ":".join("%02x" % byte for byte in self.lan.config("mac"))
+        return {"ip": self.lan.ifconfig()[0], "mac": mac, "temperature": self.temperature,
+            "sensor": self.sensor_status, "mqtt": self.mqtt_status,
+            "mqtt_enabled": self.mqtt_enabled}
 
     def request_restart(self):
         """Allow the save response to finish before resetting the device."""
@@ -91,13 +97,13 @@ class Device:
         try:
             self.client.connect(timeout=2)
             self.client.sock.settimeout(2)
-            self.mqtt_status = "verbunden"
+            self.mqtt_status = "Connected"
             print("MQTT verbunden.")
         except Exception as error:
             self.close_mqtt()
-            self.mqtt_status = "Verbindungsfehler"
+            self.mqtt_status = "Connection error"
             if isinstance(error, TypeError):
-                self.mqtt_status = "umqtt.simple aktualisieren (timeout fehlt)"
+                self.mqtt_status = "MQTT library needs timeout support"
             print("MQTT:", self.mqtt_status)
 
     def step(self):
@@ -113,16 +119,16 @@ class Device:
                 if self.sensor:
                     self.temperature, self.sensor_status = self.sensor.read()
                 else:
-                    self.temperature, self.sensor_status = None, "SPI nicht initialisiert"
+                    self.temperature, self.sensor_status = None, "SPI not initialized"
             except OSError:
-                self.temperature, self.sensor_status = None, "SPI-Fehler"
+                self.temperature, self.sensor_status = None, "SPI error"
             self.last_sample = now
         if not self.lan.isconnected():
             self.close_mqtt()
-            if self.config["mqtt_server"]:
-                self.mqtt_status = "Ethernet getrennt"
+            if self.mqtt_enabled and self.config["mqtt_server"]:
+                self.mqtt_status = "Ethernet disconnected"
             return
-        if not MQTTClient or not self.config["mqtt_server"]:
+        if not MQTTClient or not self.mqtt_enabled or not self.config["mqtt_server"]:
             return
         if self.client is None and time.ticks_diff(now, self.last_connect) >= MQTT_RETRY_MS:
             self.connect_mqtt()
@@ -134,7 +140,7 @@ class Device:
                 except Exception:
                     self.close_mqtt()
                     self.last_connect = time.ticks_ms()
-                    self.mqtt_status = "Sendefehler"
+                    self.mqtt_status = "Publish error"
             self.last_publish = now
 
 

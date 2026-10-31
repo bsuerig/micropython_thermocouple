@@ -28,14 +28,43 @@ Ethernet-Konfigurationsseite und MQTT-Temperaturversand.
   Die vorgeschlagenen Adressen unbedingt an das eigene Netz anpassen und eine
   freie IP ausserhalb des DHCP-Pools bzw. eine reservierte IP verwenden.
   Gateway `0.0.0.0` ist fuer ein isoliertes Subnetz moeglich.
-- MQTT: Broker als IPv4-/DNS-Name ohne URL-Schema, Port, Topic, Benutzername,
-  Passwort und Sendeintervall von 1 bis 65535 Sekunden. Ein leeres Broker-Feld
-  deaktiviert MQTT. Ein leeres Passwort-Feld behaelt das gespeicherte Passwort;
+- MQTT: Schalter **Ein/Aus** sowie Broker als IPv4-/DNS-Name ohne URL-Schema,
+  Port, Topic, Benutzername, Passwort und Sendeintervall von 1 bis 65535 Sekunden.
+  **Aus** deaktiviert MQTT, behaelt aber die Broker-Einstellungen. Alte
+  Konfigurationen ohne Schalter uebernehmen den bisherigen Zustand anhand des
+  Broker-Felds. Ein leeres Passwort-Feld behaelt das gespeicherte Passwort;
   zum Entfernen die Auswahl **Gespeichertes Passwort > Loeschen** verwenden.
 - MQTT-Nachricht: `{"temperature": 24.5, "unit": "\u00b0C"}` mit QoS 0, ohne Retain, eindeutiger
   Client-ID je Board. Verbindungsversuche erfolgen hoechstens alle 30 Sekunden.
   Keepalive ist deaktiviert, damit auch lange Sendeintervalle moeglich sind.
-- Die Startseite zeigt IP, Temperatur und MQTT-Status beim Laden an.
+- `config.json` speichert Ethernet- und MQTT-Einstellungen getrennt:
+
+   ```json
+   {
+      "ip": {
+         "dhcp": true,
+         "address": "192.168.1.200",
+         "netmask": "255.255.255.0",
+         "gateway": "192.168.1.1",
+         "dns": "192.168.1.1"
+      },
+      "mqtt": {
+         "enabled": false,
+         "server": "",
+         "port": 1883,
+         "topic": "sensor/temperature",
+         "user": "",
+         "password": "",
+         "interval": 5
+      }
+   }
+   ```
+
+   Vorhandene flache Konfigurationsdateien werden beim Laden uebernommen und beim
+   naechsten Speichern in dieses gruppierte Format geschrieben.
+- Die Startseite zeigt MAC-Adresse, IP-Adresse, den MQTT-Status nur bei
+   aktiviertem MQTT, Sensor-Status und Temperatur in dieser Reihenfolge an.
+   Sensor-Status und Temperatur werden sekündlich aktualisiert.
    `GET /api/temperature` liefert dasselbe JSON wie MQTT:
    `{"temperature": 24.5, "unit": "\u00b0C"}` (Einheit Grad Celsius).
    ohne Anmeldung. Bei Sensorfehler ist die Temperatur

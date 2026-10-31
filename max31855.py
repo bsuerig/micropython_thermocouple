@@ -14,24 +14,24 @@ class MAX31855:
         self.cs.value(1)
 
         if len(data) != 4:
-            return None, "Keine SPI-Daten"
+            return None, "No SPI data"
 
         raw = struct.unpack(">I", data)[0]
 
         # Verdrahtungsfehler: ein nicht antwortender Chip liefert nur 0 oder nur 1
         if raw == 0:
-            return None, "Keine Antwort: nur 0 (VIN/GND oder SO->MISO pruefen)"
+            return None, "No response: all zeros (check VIN/GND or SO->MISO)"
         if raw == 0xFFFFFFFF:
-            return None, "Keine Antwort: nur 1 (CS/SCK/SO-Verdrahtung pruefen)"
+            return None, "No response: all ones (check CS/SCK/SO wiring)"
         # Bit 3 und Bit 15 sind beim MAX31855 immer 0
         if raw & 0x8008:
-            return None, "Ungueltiger Datenframe (Verdrahtung/Takt pruefen)"
+            return None, "Invalid data frame (check wiring/clock)"
 
         # Fehlerbits prüfen (Bit 0: OC, Bit 1: SCG, Bit 2: SCV)
         if raw & 0x7:
-            faults = [name for bit, name in ((1, "Thermoelement offen/nicht angeschlossen"),
-                                             (2, "Thermoelement Kurzschluss an GND"),
-                                             (4, "Thermoelement Kurzschluss an VCC"))
+            faults = [name for bit, name in ((1, "Thermocouple open/not connected"),
+                                             (2, "Thermocouple short to GND"),
+                                             (4, "Thermocouple short to VCC"))
                       if raw & bit]
             return None, ", ".join(faults)
 

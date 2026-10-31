@@ -13,6 +13,7 @@ DEFAULT_CONFIG = {
     "netmask": "255.255.255.0",
     "gateway": "192.168.1.1",
     "dns": "192.168.1.1",
+    "mqtt_enabled": False,
     "mqtt_server": "",
     "mqtt_port": 1883,
     "mqtt_topic": "sensor/temperature",
@@ -32,14 +33,14 @@ def ipv4(value):
     """Validate dotted IPv4 notation and return its integer representation."""
     parts = value.split(".")
     if len(parts) != 4:
-        raise ValueError("Ungueltige IPv4-Adresse: " + value)
+        raise ValueError("Invalid IPv4 address: " + value)
     result = 0
     for part in parts:
         if not part or not all("0" <= char <= "9" for char in part):
-            raise ValueError("Ungueltige IPv4-Adresse: " + value)
+            raise ValueError("Invalid IPv4 address: " + value)
         number = int(part)
         if number > 255 or (len(part) > 1 and part[0] == "0"):
-            raise ValueError("Ungueltige IPv4-Adresse: " + value)
+            raise ValueError("Invalid IPv4 address: " + value)
         result = (result << 8) | number
     return result
 
@@ -47,27 +48,29 @@ def ipv4(value):
 def validate_config(values):
     """Validate all settings before allowing any persistent change."""
     if not isinstance(values, dict) or set(values) != set(DEFAULT_CONFIG):
-        raise ValueError("Unvollstaendige oder unbekannte Einstellungen.")
+        raise ValueError("Settings are incomplete or contain unknown fields.")
     checked = values.copy()
     if type(checked["dhcp"]) is not bool:
-        raise ValueError("Ungueltiger DHCP-Modus.")
+        raise ValueError("Invalid DHCP mode.")
+    if type(checked["mqtt_enabled"]) is not bool:
+        raise ValueError("Invalid MQTT mode.")
     for name in ("mqtt_port", "interval"):
         if type(checked[name]) is not int or not 1 <= checked[name] <= 65535:
-            raise ValueError(name + " muss zwischen 1 und 65535 liegen.")
+            raise ValueError(name + " must be between 1 and 65535.")
     for name, limit in (("ip", 15), ("netmask", 15), ("gateway", 15),
                         ("dns", 15), ("mqtt_server", 253), ("mqtt_topic", 256),
                         ("mqtt_user", 128), ("mqtt_password", 256)):
         value = checked[name]
         if not isinstance(value, str) or len(value.encode("utf-8")) > limit:
-            raise ValueError("Ungueltiger oder zu langer Wert: " + name)
+            raise ValueError("Invalid or oversized value: " + name)
         if any(ord(char) < 32 or ord(char) == 127 for char in value):
-            raise ValueError("Steuerzeichen sind nicht erlaubt: " + name)
+            raise ValueError("Control characters are not allowed: " + name)
     host = checked["mqtt_server"]
     if host and (not all(char.isalpha() or char.isdigit() or char in ".-" for char in host)
                  or not all(ord(char) < 128 for char in host)):
-        raise ValueError("MQTT-Server muss ein IPv4- oder DNS-Name ohne Port sein.")
+        raise ValueError("MQTT broker must be an IPv4 address or DNS name without a port.")
     if not checked["mqtt_topic"] or any(char in checked["mqtt_topic"] for char in "+#"):
-        raise ValueError("MQTT-Topic darf nicht leer sein oder Platzhalter enthalten.")
+        raise ValueError("MQTT topic cannot be empty or contain wildcards.")
     if not checked["dhcp"]:
         address = ipv4(checked["ip"])
         mask = ipv4(checked["netmask"])
@@ -75,14 +78,14 @@ def validate_config(values):
         ipv4(checked["dns"])
         inverse = mask ^ 0xffffffff
         if not mask or inverse < 3 or inverse & (inverse + 1):
-            raise ValueError("Subnetzmaske muss zusammenhaengend sein (/1 bis /30).")
+            raise ValueError("Subnet mask must be contiguous (/1 to /30).")
         if address >> 24 in (0, 127) or address >> 24 >= 224:
-            raise ValueError("Keine nutzbare lokale IPv4-Adresse.")
+            raise ValueError("No usable local IPv4 address.")
         if address & inverse in (0, inverse):
-            raise ValueError("IP darf keine Netz- oder Broadcast-Adresse sein.")
+            raise ValueError("IP address cannot be the network or broadcast address.")
         if gateway and ((gateway & mask) != (address & mask)
                         or gateway & inverse in (0, inverse) or gateway == address):
-            raise ValueError("Gateway muss eine andere Host-Adresse im selben Subnetz sein.")
+            raise ValueError("Gateway must be another host address on the same subnet.")
     return checked
 
 
@@ -91,6 +94,30 @@ def load_config():
     try:
         with open(CONFIG_FILE) as stream:
             values = json.load(stream)
+        if isinstance(values, dict) and set(values) == {"ip", "mqtt"}:
+            ip_values = values["ip"]
+            mqtt_values = values["mqtt"]
+            if (not isinstance(ip_values, dict)
+                    or set(ip_values) != {"dhcp", "address", "netmask", "gateway", "dns"}
+                    or not isinstance(mqtt_values, dict)
+                    or set(mqtt_values) != {"enabled", "server", "port", "topic", "user", "password", "interval"}):
+                raise ValueError("Invalid grouped configuration.")
+            values = {
+                "dhcp": ip_values["dhcp"],
+                "ip": ip_values["address"],
+                "netmask": ip_values["netmask"],
+                "gateway": ip_values["gateway"],
+                "dns": ip_values["dns"],
+                "mqtt_enabled": mqtt_values["enabled"],
+                "mqtt_server": mqtt_values["server"],
+                "mqtt_port": mqtt_values["port"],
+                "mqtt_topic": mqtt_values["topic"],
+                "mqtt_user": mqtt_values["user"],
+                "mqtt_password": mqtt_values["password"],
+                "interval": mqtt_values["interval"],
+            }
+        elif isinstance(values, dict) and set(values) == set(DEFAULT_CONFIG) - {"mqtt_enabled"}:
+            values["mqtt_enabled"] = bool(values["mqtt_server"])
         return validate_config(values)
     except (OSError, ValueError, TypeError):
         print("Keine gueltige config.json; starte mit DHCP und MQTT deaktiviert.")
@@ -100,10 +127,28 @@ def load_config():
 def save_config(values):
     """Replace the configuration only after a complete temporary-file write."""
     checked = validate_config(values)
+    stored = {
+        "ip": {
+            "dhcp": checked["dhcp"],
+            "address": checked["ip"],
+            "netmask": checked["netmask"],
+            "gateway": checked["gateway"],
+            "dns": checked["dns"],
+        },
+        "mqtt": {
+            "enabled": checked["mqtt_enabled"],
+            "server": checked["mqtt_server"],
+            "port": checked["mqtt_port"],
+            "topic": checked["mqtt_topic"],
+            "user": checked["mqtt_user"],
+            "password": checked["mqtt_password"],
+            "interval": checked["interval"],
+        },
+    }
     temporary = CONFIG_FILE + ".tmp"
     try:
         with open(temporary, "w") as stream:
-            json.dump(checked, stream)
+            json.dump(stored, stream)
             stream.flush()
         os.rename(temporary, CONFIG_FILE)
     except OSError:
@@ -119,7 +164,7 @@ def decode_form(body):
     result = {}
     for pair in body.split(b"&"):
         if b"=" not in pair:
-            raise ValueError("Ungueltige Formulardaten.")
+            raise ValueError("Invalid form data.")
         decoded = []
         for part in pair.split(b"=", 1):
             part = part.replace(b"+", b" ")
@@ -128,10 +173,10 @@ def decode_form(body):
             while index < len(part):
                 if part[index] == 37:
                     if index + 2 >= len(part):
-                        raise ValueError("Ungueltige URL-Kodierung.")
+                        raise ValueError("Invalid URL encoding.")
                     digits = part[index + 1:index + 3]
                     if any(char not in b"0123456789abcdefABCDEF" for char in digits):
-                        raise ValueError("Ungueltige URL-Kodierung.")
+                        raise ValueError("Invalid URL encoding.")
                     buffer.append(int(digits, 16))
                     index += 3
                 else:
@@ -140,7 +185,7 @@ def decode_form(body):
             decoded.append(buffer.decode("utf-8"))
         name, value = decoded
         if name in result:
-            raise ValueError("Doppeltes Formularfeld.")
+            raise ValueError("Duplicate form field.")
         result[name] = value
     return result
 
@@ -149,11 +194,14 @@ def form_config(fields, previous):
     """Convert a full form without ever returning the stored MQTT password."""
     required = set(DEFAULT_CONFIG) - {"mqtt_password"}
     if set(fields) != required | {"mqtt_password", "csrf", "clear_password"}:
-        raise ValueError("Unvollstaendiges Formular.")
+        raise ValueError("Incomplete form.")
     values = {name: fields[name].strip() for name in DEFAULT_CONFIG}
     if values["dhcp"] not in ("yes", "no"):
-        raise ValueError("Ungueltiger DHCP-Modus.")
+        raise ValueError("Invalid DHCP mode.")
     values["dhcp"] = values["dhcp"] == "yes"
+    if values["mqtt_enabled"] not in ("yes", "no"):
+        raise ValueError("Invalid MQTT mode.")
+    values["mqtt_enabled"] = values["mqtt_enabled"] == "yes"
     for name in ("mqtt_port", "interval"):
         values[name] = int(values[name])
     values["mqtt_password"] = fields["mqtt_password"] or previous["mqtt_password"]
@@ -168,37 +216,73 @@ def escape_html(value):
 
 
 PAGE = """<!doctype html>
-<html lang="de"><head><meta charset="utf-8">
+<html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP32-P4-ETH | Thermoelement</title>
+<title>ESP32-P4-ETH | Thermocouple</title>
 <style>
 :root{color-scheme:dark;--background:#111d2b;--ink:#f0f5f7;--muted:#b6c5ce;--brand:#71c2a4;--brand-2:#2a7b9b;--line:#3e5365;--field:#1a2b3b;--font:"Lato","Trebuchet MS",sans-serif}
 *{box-sizing:border-box;letter-spacing:0}html{scroll-padding-top:1rem}
 body{margin:0;background:linear-gradient(145deg,#172c3a 0%,var(--background) 55%,#18243a 100%);color:var(--ink);font:1rem var(--font);min-height:100vh}
-header{border-bottom:1px solid var(--line);background:#162332;padding:1.4rem max(1.25rem,calc((100% - 980px)/2));display:flex;align-items:center;justify-content:space-between;gap:1rem}
+header{border-bottom:1px solid var(--line);background:#162332;padding:1.4rem 1.25rem;display:flex;align-items:center;justify-content:space-between;gap:1rem}
 .identity{border-left:3px solid var(--brand);padding-left:1rem;min-width:0}h1{font-family:"Cal Sans",var(--font);font-size:1.65rem;font-weight:700;margin:0 0 .35rem;overflow-wrap:anywhere}.identity p{margin:0;font-size:.8rem;color:var(--muted)}
 nav{display:flex;gap:1.25rem;flex-wrap:wrap}nav a{color:var(--ink);text-decoration:none;font-size:.9rem;padding:.5rem 0;border-bottom:2px solid transparent}nav a:hover{color:var(--brand);border-color:var(--brand)}
-main{max-width:1020px;margin:auto;padding:0 1.25rem 2rem}.status{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border-bottom:1px solid var(--line);padding:2rem 0;margin-bottom:.5rem;gap:1.5rem}
-.reading{min-width:0}.reading+.reading{border-left:1px solid var(--line);padding-left:1.5rem}.reading span{display:block;color:var(--muted);font-size:.78rem;margin-bottom:.6rem}.reading strong{display:block;font-weight:500;font-size:1.35rem;overflow-wrap:anywhere}.reading.temperature strong{color:var(--brand);font-size:1.8rem;line-height:1.1}
+main{padding:0 1.25rem 2rem}.status{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));border-bottom:1px solid var(--line);padding:2rem 0;margin-bottom:.5rem;gap:1.5rem}.status:not(.with-mqtt){grid-template-columns:repeat(4,minmax(0,1fr))}
+.reading{min-width:0}.reading+.reading{border-left:1px solid var(--line);padding-left:1.5rem}.reading span{display:block;color:var(--muted);font-size:.78rem;margin-bottom:.6rem}.reading strong{display:block;font-weight:500;font-size:1.35rem;overflow-wrap:anywhere}.reading.temperature strong{color:var(--brand);font-size:1.8rem;line-height:1.1}.reading.temperature .api-link{margin-left:.5rem;color:var(--muted);font-size:.75rem;text-decoration:underline;text-underline-offset:.2em}.reading.temperature .api-link:hover{color:var(--brand)}
 fieldset{border:0;border-bottom:1px solid var(--line);padding:1.5rem 0 2rem;margin:1.5rem 0 0;min-width:0;scroll-margin-top:1rem}legend{font-family:"Cal Sans",var(--font);font-size:1.3rem;font-weight:700;padding:0;display:flex;align-items:center;gap:.8rem}legend span{color:var(--brand);font: .78rem var(--font)}
 .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1.25rem 1.75rem}label{display:block;font-size:.85rem;color:var(--muted);line-height:1.5;min-width:0}
 input,select{display:block;width:100%;height:48px;margin-top:.45rem;padding:.65rem .85rem;border:1px solid #657b8e;border-radius:6px;background:var(--field);color:var(--ink);font:1rem var(--font);min-width:0;transition:border-color .15s,background .15s}input:hover,select:hover{border-color:var(--brand)}input:focus,select:focus{background:#203747;border-color:var(--brand)}
+.mode-control{grid-column:1/-1;display:flex;align-items:center;gap:1rem}.mode-control>span{font-size:.85rem;color:var(--muted)}.segmented{display:flex;position:relative;padding:3px;border:1px solid var(--line);border-radius:6px;background:var(--field)}.segmented input{position:absolute;width:1px;height:1px;margin:0;opacity:0}.segmented label{padding:.55rem .9rem;border-radius:4px;color:var(--muted);cursor:pointer;line-height:1.2;text-align:center}.segmented input:checked+label{background:var(--brand);color:#102b25}.segmented input:focus-visible+label{outline:3px solid #9ee6ce;outline-offset:2px}.network-fields,.mqtt-fields{grid-column:1/-1;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1.25rem 1.75rem}#ethernet:has(#dhcp-yes:checked) .network-fields,#mqtt:has(#mqtt-off:checked) .mqtt-fields{display:none}
 .actions{display:flex;justify-content:flex-end;padding:1.5rem 0 .5rem}button{min-height:48px;padding:.8rem 1.4rem;border:1px solid var(--brand);border-radius:6px;background:var(--brand);color:#102b25;font:700 .95rem var(--font);cursor:pointer;max-width:100%;transition:background .15s}button:hover{background:#92d6bd}button:active{background:#60b195}
 :focus-visible{outline:3px solid #9ee6ce;outline-offset:4px}.message{padding:1rem 1.25rem;border-left:3px solid #f4ce82;background:#29343a;color:#ffe2ab;line-height:1.6}p{overflow-wrap:anywhere}.footer{margin:.5rem 0 0;color:var(--muted);font-size:.75rem}
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
-@media(max-width:600px){header{align-items:flex-start;flex-direction:column;padding:1.25rem}h1{font-size:1.4rem}nav{gap:1.5rem}.grid{grid-template-columns:1fr}.status{grid-template-columns:1fr;padding:1.5rem 0;gap:1.25rem}.reading+.reading{border-left:0;padding-left:0}.reading{display:flex;justify-content:space-between;align-items:baseline;gap:1rem}.reading span{margin:0;flex-shrink:0}.reading strong{text-align:right;font-size:1.1rem}.reading.temperature strong{font-size:1.5rem}.actions button{width:100%}}
-</style></head><body><header><div class="identity"><h1>ESP32-P4-ETH</h1><p>THERMOELEMENT / MAX31855</p></div><nav aria-label="Konfigurationsbereiche"><a href="#ethernet">Ethernet</a><a href="#mqtt">MQTT</a></nav></header>
-<main><section class="status" aria-label="Geraetestatus"><div class="reading"><span>IP-Adresse</span><strong>@address@</strong></div><div class="reading temperature"><span>Temperatur</span><strong>@temperature@</strong></div><div class="reading"><span>Sensor-Status</span><strong>@sensor@</strong></div><div class="reading"><span>MQTT-Status</span><strong>@mqtt_status@</strong></div></section>
+@media(max-width:600px){header{align-items:flex-start;flex-direction:column;padding:1.25rem}h1{font-size:1.4rem}nav{gap:1.5rem}.grid,.network-fields,.mqtt-fields{grid-template-columns:1fr}.status,.status:not(.with-mqtt){grid-template-columns:1fr;padding:1.5rem 0;gap:1.25rem}.reading+.reading{border-left:0;padding-left:0}.reading{display:flex;justify-content:space-between;align-items:baseline;gap:1rem}.reading span{margin:0;flex-shrink:0}.reading strong{text-align:right;font-size:1.1rem}.reading.temperature strong{font-size:1.5rem}.actions button{width:100%}}
+</style></head><body><header><div class="identity"><h1>ESP32-P4-ETH</h1><p>THERMOCOUPLE / MAX31855</p></div><nav aria-label="Configuration sections"><a href="#ethernet">Ethernet</a><a href="#mqtt">MQTT</a></nav></header>
+<main><section class="@status_class@" aria-label="Device status"><div class="reading"><span>MAC address</span><strong>@mac@</strong></div><div class="reading"><span>IP address</span><strong>@address@</strong></div>@mqtt_reading@<div class="reading"><span>Sensor status</span><strong id="sensor-status">@sensor@</strong></div><div class="reading temperature"><span>Temperature <a class="api-link" href="/api/temperature" target="_blank" rel="noopener noreferrer" aria-label="Open temperature and sensor status JSON">API</a></span><strong id="temperature-reading">@temperature@</strong></div></section>
 @message@
 <form action="/save" method="post"><input type="hidden" name="csrf" value="@csrf@">
 <fieldset id="ethernet"><legend><span aria-hidden="true">01</span>Ethernet</legend><div class="grid">
-<label>Adressvergabe<select name="dhcp"><option value="yes" @dhcp_yes@>DHCP</option><option value="no" @dhcp_no@>Statische IP</option></select></label>
-@network_fields@
+<div class="mode-control"><span>Address mode</span><div class="segmented" role="radiogroup" aria-label="Address mode"><input type="radio" id="dhcp-yes" name="dhcp" value="yes" @dhcp_yes@><label for="dhcp-yes">DHCP</label><input type="radio" id="dhcp-no" name="dhcp" value="no" @dhcp_no@><label for="dhcp-no">Static IP</label></div></div>
+<div class="network-fields">@network_fields@</div>
 </div></fieldset><fieldset id="mqtt"><legend><span aria-hidden="true">02</span>MQTT</legend><div class="grid">
-@mqtt_fields@
-<label>Passwort (leer = unveraendert)<input type="password" name="mqtt_password" maxlength="256" autocomplete="new-password"></label>
-<label>Gespeichertes Passwort<select name="clear_password"><option value="no">Beibehalten</option><option value="yes">Loeschen</option></select></label>
-</div></fieldset><div class="actions"><button type="submit">Speichern und neu starten</button></div></form><p class="footer">ESP32-P4-ETH / MAX31855</p></main></body></html>"""
+<div class="mode-control"><span>MQTT</span><div class="segmented" role="radiogroup" aria-label="MQTT"><input type="radio" id="mqtt-off" name="mqtt_enabled" value="no" @mqtt_off@><label for="mqtt-off">Off</label><input type="radio" id="mqtt-on" name="mqtt_enabled" value="yes" @mqtt_on@><label for="mqtt-on">On</label></div></div>
+<div class="mqtt-fields">@mqtt_fields@
+<label>Password (blank = unchanged)<input type="password" name="mqtt_password" maxlength="256" autocomplete="new-password"></label>
+<label>Stored password<select name="clear_password"><option value="no">Keep</option><option value="yes">Clear</option></select></label>
+</div></div></fieldset><div class="actions"><button type="submit">Save and reboot</button></div></form><p class="footer">ESP32-P4-ETH / MAX31855</p><script nonce="@page_nonce@">
+const form = document.querySelector('form');
+let polling = false;
+let submitting = false;
+let submitQueued = false;
+form.addEventListener('submit', function(event) {
+    submitting = true;
+    if (polling) {
+        event.preventDefault();
+        submitQueued = true;
+    }
+});
+async function refreshStatus() {
+    if (submitting) return;
+    polling = true;
+    try {
+        const response = await fetch('/api/temperature', {cache: 'no-store'});
+        if (response.ok) {
+            const reading = await response.json();
+            document.getElementById('sensor-status').textContent = reading.sensor
+                || (reading.temperature === null ? 'Sensor error' : 'OK');
+            document.getElementById('temperature-reading').textContent =
+                reading.temperature === null ? '--' : String(reading.temperature) + ' \u00b0C';
+        }
+    } catch (error) {}
+    polling = false;
+    if (submitQueued) {
+        submitQueued = false;
+        form.requestSubmit();
+        return;
+    }
+    window.setTimeout(refreshStatus, 1000);
+}
+refreshStatus();
+</script></main></body></html>"""
 
 
 class ConfigServer:
@@ -210,28 +294,37 @@ class ConfigServer:
         self.status = status
         self.restart = restart
         self.csrf = binascii.hexlify(os.urandom(16)).decode()
+        self.page_nonce = binascii.hexlify(os.urandom(16)).decode()
         self.busy = False
         self.restart_pending = False
 
     def page(self, message=""):
         """Render an accessible form with escaped configuration and status values."""
+        self.page_nonce = binascii.hexlify(os.urandom(16)).decode()
         values = self.status()
+        mqtt_status = values["mqtt"]
+        mqtt_enabled = values.get("mqtt_enabled", mqtt_status != "Disabled")
         replacements = {
+            "status_class": "status with-mqtt" if mqtt_enabled else "status",
             "address": values["ip"],
-            "temperature": str(values["temperature"]) + " C" if values["temperature"] is not None else "--",
-            "sensor": values.get("sensor", "OK" if values["temperature"] is not None else "Sensorfehler"),
-            "mqtt_status": values["mqtt"],
+            "mac": values.get("mac", "--"),
+            "temperature": str(values["temperature"]) + " \u00b0C" if values["temperature"] is not None else "--",
+            "sensor": values.get("sensor", "OK" if values["temperature"] is not None else "Sensor error"),
             "csrf": self.csrf,
+            "page_nonce": self.page_nonce,
         }
         page = PAGE
         for name, value in replacements.items():
             page = page.replace("@" + name + "@", escape_html(value))
+        mqtt_reading = ('<div class="reading"><span>MQTT status</span><strong>'
+                        + escape_html(mqtt_status) + "</strong></div>" if mqtt_enabled else "")
+        page = page.replace("@mqtt_reading@", mqtt_reading)
         for group, items in (
-            ("network", (("ip", "IP-Adresse"), ("netmask", "Subnetzmaske"),
-                         ("gateway", "Gateway"), ("dns", "DNS-Server"))),
-            ("mqtt", (("mqtt_server", "Broker (leer = deaktiviert)"), ("mqtt_port", "Port"),
-                      ("mqtt_topic", "Topic"), ("mqtt_user", "Benutzername"),
-                      ("interval", "Sendeintervall (Sekunden)"))),
+            ("network", (("ip", "IP address"), ("netmask", "Subnet mask"),
+                         ("gateway", "Gateway"), ("dns", "DNS server"))),
+            ("mqtt", (("mqtt_server", "Broker (blank = disabled)"), ("mqtt_port", "Port"),
+                      ("mqtt_topic", "Topic"), ("mqtt_user", "Username"),
+                      ("interval", "Publish interval (seconds)"))),
         ):
             inputs = []
             for name, label in items:
@@ -240,8 +333,11 @@ class ConfigServer:
                 inputs.append('<label>' + label + '<input name="' + name + '" ' + attributes
                               + ' value="' + escape_html(self.config[name]) + '"></label>')
             page = page.replace("@" + group + "_fields@", "".join(inputs))
-        page = page.replace("@dhcp_yes@", "selected" if self.config["dhcp"] else "")
-        page = page.replace("@dhcp_no@", "" if self.config["dhcp"] else "selected")
+        page = page.replace("@dhcp_yes@", "checked" if self.config["dhcp"] else "")
+        page = page.replace("@dhcp_no@", "" if self.config["dhcp"] else "checked")
+        mqtt_enabled = self.config.get("mqtt_enabled", bool(self.config.get("mqtt_server")))
+        page = page.replace("@mqtt_off@", "" if mqtt_enabled else "checked")
+        page = page.replace("@mqtt_on@", "checked" if mqtt_enabled else "")
         return page.replace("@message@", '<p class="message" role="status">' + escape_html(message) + "</p>" if message else "")
 
     async def respond(self, writer, status, body, content_type="text/html; charset=utf-8", extra=""):
@@ -252,7 +348,8 @@ class ConfigServer:
                   + "\r\nConnection: close\r\nCache-Control: no-store"
                   + "\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY"
                   + "\r\nReferrer-Policy: no-referrer"
-                  + "\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'\r\n"
+              + "\r\nContent-Security-Policy: default-src 'none'; connect-src 'self'; style-src 'unsafe-inline'; script-src 'nonce-"
+              + self.page_nonce + "'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'\r\n"
                   + extra + "\r\n")
         writer.write(header.encode() + payload)
         await writer.drain()
@@ -263,29 +360,29 @@ class ConfigServer:
         while not header.endswith(b"\r\n\r\n"):
             chunk = await reader.read(1)
             if not chunk or len(header) >= 4096:
-                raise ValueError("HTTP-Header fehlt oder ist zu gross.")
+                raise ValueError("HTTP header is missing or too large.")
             header.extend(chunk)
         lines = header.decode("utf-8").split("\r\n")
         method, path, version = lines[0].split(" ")
         if version not in ("HTTP/1.0", "HTTP/1.1"):
-            raise ValueError("Ungueltige HTTP-Version.")
+            raise ValueError("Invalid HTTP version.")
         headers = {}
         for line in lines[1:-2]:
             name, value = line.split(":", 1)
             name = name.lower().strip()
             if name in headers:
-                raise ValueError("Doppelter HTTP-Header.")
+                raise ValueError("Duplicate HTTP header.")
             headers[name] = value.strip()
         if "transfer-encoding" in headers:
-            raise ValueError("Transfer-Encoding wird nicht unterstuetzt.")
+            raise ValueError("Transfer-Encoding is not supported.")
         length = int(headers.get("content-length", "0"))
         if not 0 <= length <= 4096:
-            raise ValueError("Formular ist zu gross.")
+            raise ValueError("Form is too large.")
         body = bytearray()
         while len(body) < length:
             chunk = await reader.read(length - len(body))
             if not chunk:
-                raise ValueError("Unvollstaendiges Formular.")
+                raise ValueError("Incomplete form.")
             body.extend(chunk)
         return method, path, headers, bytes(body)
 
@@ -296,16 +393,17 @@ class ConfigServer:
             await self.respond(writer, "200 OK", self.page())
         elif method == "GET" and path == "/api/temperature":
             values = self.status()
-            await self.respond(writer, "200 OK", temperature_json(values["temperature"], values.get("sensor", "OK" if values["temperature"] is not None else "Sensorfehler")), "application/json; charset=utf-8")
+            await self.respond(writer, "200 OK", temperature_json(values["temperature"], values.get("sensor", "OK" if values["temperature"] is not None else "Sensor error")), "application/json; charset=utf-8")
         elif method == "POST" and path == "/save":
             if self.restart_pending:
-                await self.respond(writer, "409 Conflict", "Neustart bereits geplant.")
+                await self.respond(writer, "409 Conflict", "Reboot is already scheduled.")
                 return
             if headers.get("content-type", "").split(";", 1)[0].strip() != "application/x-www-form-urlencoded":
-                raise ValueError("Ungueltiger Formular-Inhaltstyp.")
+                raise ValueError("Invalid form content type.")
             fields = decode_form(body)
             if fields.get("csrf") != self.csrf:
-                await self.respond(writer, "403 Forbidden", "Ungueltiges Formular-Token.")
+                await self.respond(writer, "403 Forbidden",
+                                   self.page("Form token expired. Please submit again."))
                 return
             try:
                 values = form_config(fields, self.config)
@@ -315,9 +413,9 @@ class ConfigServer:
             save_config(values)
             self.restart_pending = True
             self.restart()
-            await self.respond(writer, "200 OK", self.page("Gespeichert. Neustart in wenigen Sekunden. Die IP-Adresse kann sich aendern."))
+            await self.respond(writer, "200 OK", self.page("Saved. Rebooting in a few seconds. The IP address may change."))
         else:
-            await self.respond(writer, "404 Not Found", "Nicht gefunden.")
+            await self.respond(writer, "404 Not Found", "Not found.")
 
     async def handle(self, reader, writer):
         """Limit concurrent work, request duration and always close client streams."""
@@ -329,9 +427,9 @@ class ConfigServer:
             try:
                 await asyncio.wait_for(self.dispatch(reader, writer), 5)
             except (ValueError, UnicodeError):
-                await asyncio.wait_for(self.respond(writer, "400 Bad Request", "Ungueltige HTTP-Anfrage."), 2)
+                await asyncio.wait_for(self.respond(writer, "400 Bad Request", "Invalid HTTP request."), 2)
             except OSError:
-                await asyncio.wait_for(self.respond(writer, "503 Service Unavailable", "Anfrage oder Speichern fehlgeschlagen. Bitte erneut versuchen."), 2)
+                await asyncio.wait_for(self.respond(writer, "503 Service Unavailable", "Request or save failed. Please try again."), 2)
             except asyncio.TimeoutError:
                 pass
         except (OSError, asyncio.TimeoutError):

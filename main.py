@@ -8,6 +8,7 @@ import network
 import time
 
 from config_web import ConfigServer, load_config, temperature_json
+from calibration import calibrate_temperature
 from max31855 import MAX31855
 
 try:
@@ -50,7 +51,11 @@ class Device:
         self.lan = lan
         self.sensor = sensor
         self.temperature = None
+        self.raw_temperature = None
         self.sensor_status = "Not sampled yet"
+        calibration = config.get("calibration", {})
+        self.calibration_id = calibration.get("active_id", "")
+        self.calibration_applied = False
         self.client = None
         self.mqtt_status = "Disabled"
         self.mqtt_enabled = config.get("mqtt_enabled", bool(config.get("mqtt_server")))
@@ -68,8 +73,10 @@ class Device:
         """Return only public runtime data, never broker credentials."""
         mac = ":".join("%02x" % byte for byte in self.lan.config("mac"))
         return {"ip": self.lan.ifconfig()[0], "mac": mac, "temperature": self.temperature,
+            "raw_temperature": self.raw_temperature,
             "sensor": self.sensor_status, "mqtt": self.mqtt_status,
-            "mqtt_enabled": self.mqtt_enabled}
+            "mqtt_enabled": self.mqtt_enabled, "sensor_id": self.calibration_id,
+            "calibration_applied": self.calibration_applied}
 
     def request_restart(self):
         """Allow the save response to finish before resetting the device."""
@@ -115,9 +122,21 @@ class Device:
                 machine.reset()
             return
         if time.ticks_diff(now, self.last_sample) >= 1000:
+            self.calibration_applied = False
+            self.raw_temperature = None
             try:
                 if self.sensor:
-                    self.temperature, self.sensor_status = self.sensor.read()
+                    temperature, self.sensor_status = self.sensor.read()
+                    self.raw_temperature = temperature
+                    calibration = self.config.get("calibration", {})
+                    active_id = calibration.get("active_id", "")
+                    self.calibration_id = active_id
+                    profile = calibration.get("profiles", {}).get(active_id)
+                    if temperature is not None and profile:
+                        raw_temperature = temperature
+                        temperature = calibrate_temperature(temperature, profile["points"])
+                        self.calibration_applied = temperature != raw_temperature
+                    self.temperature = temperature
                 else:
                     self.temperature, self.sensor_status = None, "SPI not initialized"
             except OSError:
@@ -136,7 +155,10 @@ class Device:
             if self.client is not None and self.temperature is not None:
                 try:
                     self.client.publish(self.config["mqtt_topic"].encode(),
-                                        temperature_json(self.temperature, self.sensor_status).encode("utf-8"))
+                                        temperature_json(
+                                            self.temperature, self.sensor_status,
+                                            self.calibration_id, self.calibration_applied,
+                                            self.raw_temperature).encode("utf-8"))
                 except Exception:
                     self.close_mqtt()
                     self.last_connect = time.ticks_ms()

@@ -185,3 +185,83 @@ This specification covers the Ethernet address-mode and MQTT enable controls on 
 - Tier: Host.
 - Evidence: Rendered-page, status, and form-response assertions.
 - Cleanup: Restore the original configuration and status provider.
+
+### FR-CAL-01 — Thermocouple calibration profiles
+
+- `type: functional`
+- `priority: must`
+- `source: user`
+- `status: approved`
+- The configuration UI shall list saved `Thermocouple_ID` profiles in a dropdown and allow the user to select one or choose `Create new profile`. The user shall configure 2 to 10 pairs of sensor reading and reference temperature in degrees Celsius. The active profile and all profiles shall be persisted in `calibration.json` under `active_id` and `profiles.<Thermocouple_ID>.points`; each point shall contain numeric `measured` and `reference` values. Existing profiles embedded in `config.json` shall be migrated to `calibration.json` on load.
+
+**Verification contract**
+
+- Preconditions: The device configuration page is available.
+- Stimulus: Create or select a profile ID, enter the point count and corresponding sensor/reference temperatures, and save.
+- Expected observations: The active ID and all profile points are saved and restored on the next page load; other profiles remain unchanged.
+- Timing: On the save/reboot cycle.
+- Tolerance: Point values are represented as finite numeric Celsius values; profile IDs are 1 to 32 ASCII letters, digits, spaces, periods, hyphens, or underscores, with no leading or trailing whitespace.
+- Prohibited outcomes: Saving one profile deletes or changes another profile.
+- Tier: Host.
+- Evidence: Form, JSON round-trip, and profile-retention tests.
+- Cleanup: Restore the original config fixture.
+
+### FR-CAL-02 — Piecewise linear correction
+
+- `type: functional`
+- `priority: must`
+- `source: user`
+- `status: approved`
+- For a valid active profile, the device shall convert sensor readings to reference temperatures by piecewise linear interpolation between the profile's ordered calibration points. It shall not extrapolate outside the range; readings outside the range shall remain uncorrected.
+
+**Verification contract**
+
+- Preconditions: At least two valid, strictly increasing sensor-reading and reference-temperature values exist in the active profile.
+- Stimulus: Provide readings at a point, between points, and outside both ends of the profile.
+- Expected observations: Exact point readings map to their reference values; intermediate readings use linear interpolation; out-of-range readings are unchanged.
+- Timing: During the sensor sampling operation.
+- Tolerance: Absolute difference no greater than 0.001 °C in host calculations.
+- Prohibited outcomes: Extrapolated correction outside the calibrated range.
+- Tier: Host.
+- Evidence: Pure interpolation tests and a mocked Device sampling test.
+- Cleanup: Restore the original active profile.
+
+### FR-CAL-03 — Visible calibration identity and applied state
+
+- `type: functional`
+- `priority: must`
+- `source: user`
+- `status: approved`
+- The status row shall show the active calibration profile ID between MQTT status and sensor status. It shall show a `Calibrated` indicator when correction changes the raw sensor value and omit that indicator otherwise. The live status endpoint shall provide these values without changing the existing temperature API or MQTT payload.
+
+**Verification contract**
+
+- Preconditions: A calibration profile is active and the status page is open.
+- Stimulus: Sample a reading that is corrected, then one that remains unchanged; poll the live status endpoint.
+- Expected observations: The active ID appears in the required status-row position; `Calibrated` appears only when the numeric temperature changes; live updates refresh both values.
+- Timing: On the next one-second status poll.
+- Tolerance: Correction indicator is true exactly when corrected and raw numeric values differ.
+- Prohibited outcomes: Existing `/api/temperature` JSON or MQTT payload gains calibration metadata.
+- Tier: Host.
+- Evidence: Device status, status endpoint, page rendering, and MQTT payload tests.
+- Cleanup: Restore the original calibration profile and sensor reading.
+
+### FR-CAL-04 — Calibration profile API
+
+- `type: functional`
+- `priority: must`
+- `source: user`
+- `status: approved`
+- `GET /api/calibration` shall return the active profile and all saved profiles. `POST /api/calibration` shall activate an existing profile when given `sensor_id`, or create/update and activate a profile when given `sensor_id` and `points`. Updates shall retain all other profiles. MQTT, `GET /api/temperature`, and `GET /api/status` shall emit identical JSON containing `temperature`, `unit`, `sensor`, `sensor_id`, `calibrated`, and `raw_temperature`.
+
+**Verification contract**
+
+- Preconditions: The device has zero or more valid profiles and accepts JSON requests on the local network.
+- Stimulus: GET the calibration resource; POST a new profile, update it, and POST an existing ID without points to activate it; GET temperature afterward.
+- Expected observations: Profile data round-trips, active_id changes, unrelated profiles remain, and MQTT plus both temperature endpoints return identical raw/corrected metadata.
+- Timing: API responses complete within the existing request timeout.
+- Tolerance: Same profile and point validation rules as the web UI.
+- Prohibited outcomes: An API update removes unrelated profiles or makes MQTT and temperature API JSON differ.
+- Tier: Host.
+- Evidence: API GET/POST tests, JSON persistence tests, and MQTT/API schema assertions.
+- Cleanup: Restore the original calibration file fixture.

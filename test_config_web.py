@@ -13,7 +13,57 @@ from unittest.mock import Mock, call, patch
 from urllib.parse import urlencode
 
 import config_web as web
+from calibration import calibrate_temperature, update_calibration, validate_calibration
 from max31855 import MAX31855
+
+
+class CalibrationTests(unittest.TestCase):
+    """Verify calibration profile validation and interpolation behavior."""
+
+    def setUp(self):
+        self.points = [
+            {"measured": 0.0, "reference": 1.0},
+            {"measured": 100.0, "reference": 99.0},
+            {"measured": 200.0, "reference": 197.0},
+        ]
+
+    def test_linear_interpolation_and_exact_points(self):
+        self.assertEqual(calibrate_temperature(100.0, self.points), 99.0)
+        self.assertEqual(calibrate_temperature(150.0, self.points), 148.0)
+
+    def test_no_extrapolation_outside_profile_range(self):
+        self.assertEqual(calibrate_temperature(-1.0, self.points), -1.0)
+        self.assertEqual(calibrate_temperature(201.0, self.points), 201.0)
+
+    def test_profile_validation_rejects_duplicate_sensor_readings(self):
+        profile = {"active_id": "TC-01", "profiles": {"TC-01": {"points": [
+            {"measured": 20, "reference": 21}, {"measured": 20, "reference": 22},
+        ]}}}
+        with self.assertRaises(ValueError):
+            validate_calibration(profile)
+
+    def test_profile_validation_rejects_invalid_id_and_non_monotonic_reference(self):
+        for profile in (
+            {"active_id": "TC/01", "profiles": {}},
+            {"active_id": "TC-01", "profiles": {"TC-01": {"points": [
+                {"measured": 0, "reference": 10}, {"measured": 100, "reference": 9},
+            ]}}},
+        ):
+            with self.subTest(profile=profile), self.assertRaises(ValueError):
+                validate_calibration(profile)
+
+    def test_api_profile_update_preserves_other_profiles(self):
+        existing = {"active_id": "TC-01", "profiles": {"TC-01": {"points": [
+            {"measured": 0, "reference": 1}, {"measured": 100, "reference": 99},
+        ]}}}
+        updated = update_calibration(existing, "Thermocouple 2", [
+            {"measured": 10, "reference": 11}, {"measured": 90, "reference": 89},
+        ])
+        self.assertEqual(updated["active_id"], "Thermocouple 2")
+        self.assertIn("TC-01", updated["profiles"])
+        selected = update_calibration(updated, "TC-01")
+        self.assertEqual(selected["active_id"], "TC-01")
+        self.assertIn("Thermocouple 2", selected["profiles"])
 
 
 class SensorStatusTests(unittest.TestCase):
@@ -87,10 +137,15 @@ class LanTests(unittest.TestCase):
         device = self.Device.__new__(self.Device)
         device.lan = self.lan
         device.temperature = None
-        device.sensor_status = "Noch keine Messung"
+        device.sensor_status = "Not sampled yet"
         device.mqtt_status = "Disabled"
         device.mqtt_enabled = False
-        self.assertEqual(device.status()["mac"], "02:00:00:00:00:01")
+        device.calibration_id = "TC-01"
+        device.calibration_applied = True
+        status = device.status()
+        self.assertEqual(status["mac"], "02:00:00:00:00:01")
+        self.assertEqual(status["sensor_id"], "TC-01")
+        self.assertTrue(status["calibration_applied"])
         self.lan.config.assert_called_once_with("mac")
 
     def test_disabled_mqtt_does_not_connect_or_publish(self):
@@ -115,6 +170,50 @@ class LanTests(unittest.TestCase):
             legacy_device = self.Device(legacy_config, self.lan, None)
         self.assertEqual(legacy_device.mqtt_status, "Disconnected")
 
+    def test_device_applies_active_calibration_profile(self):
+        """Use the selected calibration profile for sensor readings."""
+        clock = types.SimpleNamespace(ticks_ms=lambda: 100000,
+                                      ticks_add=lambda value, delta: value + delta,
+                                      ticks_diff=lambda first, second: first - second)
+        sensor = Mock()
+        sensor.read.return_value = (150.0, "OK")
+        config = dict(web.DEFAULT_CONFIG, calibration={
+            "active_id": "TC-01",
+            "profiles": {"TC-01": {"points": [
+                {"measured": 0.0, "reference": 1.0},
+                {"measured": 100.0, "reference": 99.0},
+                {"measured": 200.0, "reference": 197.0},
+            ]}},
+        })
+        with patch.dict(self.Device.__init__.__globals__, {"time": clock, "MQTTClient": None}):
+            device = self.Device(config, self.lan, sensor)
+            device.last_sample = clock.ticks_ms() - 1000
+            device.step()
+        self.assertEqual(device.temperature, 148.0)
+        self.assertEqual(device.sensor_status, "OK")
+        self.assertTrue(device.calibration_applied)
+
+    def test_device_does_not_mark_unchanged_temperature_as_calibrated(self):
+        """Only flag readings whose numeric value changes after calibration."""
+        clock = types.SimpleNamespace(ticks_ms=lambda: 100000,
+                                      ticks_add=lambda value, delta: value + delta,
+                                      ticks_diff=lambda first, second: first - second)
+        sensor = Mock()
+        sensor.read.return_value = (150.0, "OK")
+        config = dict(web.DEFAULT_CONFIG, calibration={
+            "active_id": "TC-01",
+            "profiles": {"TC-01": {"points": [
+                {"measured": 0.0, "reference": 0.0},
+                {"measured": 200.0, "reference": 200.0},
+            ]}},
+        })
+        with patch.dict(self.Device.__init__.__globals__, {"time": clock, "MQTTClient": None}):
+            device = self.Device(config, self.lan, sensor)
+            device.last_sample = clock.ticks_ms() - 1000
+            device.step()
+        self.assertEqual(device.temperature, 150.0)
+        self.assertFalse(device.calibration_applied)
+
 
 class ConfigTests(unittest.TestCase):
     """Check validation, decoding and durable settings without hardware."""
@@ -123,22 +222,28 @@ class ConfigTests(unittest.TestCase):
         """Keep the previous settings when validation or file replacement fails."""
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(web, "CONFIG_FILE", os.path.join(directory, "config.json")):
-                web.save_config(web.DEFAULT_CONFIG)
-                self.assertEqual(web.load_config(), web.DEFAULT_CONFIG)
-                with self.assertRaises(ValueError):
-                    web.save_config(dict(web.DEFAULT_CONFIG, mqtt_port=0))
-                with patch.object(web.os, "rename", side_effect=OSError):
-                    with self.assertRaises(OSError):
-                        web.save_config(dict(web.DEFAULT_CONFIG, mqtt_topic="new/topic"))
-                self.assertEqual(web.load_config(), web.DEFAULT_CONFIG)
-                self.assertFalse(os.path.exists(web.CONFIG_FILE + ".tmp"))
+                with patch.object(web, "CALIBRATION_FILE", os.path.join(directory, "calibration.json")):
+                    web.save_config(web.DEFAULT_CONFIG)
+                    self.assertEqual(web.load_config(), web.DEFAULT_CONFIG)
+                    with self.assertRaises(ValueError):
+                        web.save_config(dict(web.DEFAULT_CONFIG, mqtt_port=0))
+                    with patch.object(web.os, "replace", side_effect=OSError):
+                        with self.assertRaises(OSError):
+                            web.save_config(dict(web.DEFAULT_CONFIG, mqtt_topic="new/topic"))
+                    self.assertEqual(web.load_config(), web.DEFAULT_CONFIG)
+                    self.assertFalse(os.path.exists(web.CONFIG_FILE + ".tmp"))
+                    self.assertFalse(os.path.exists(web.CALIBRATION_FILE + ".tmp"))
 
     def test_grouped_config_file_roundtrip(self):
-        """Persist IP and MQTT settings in separate top-level objects."""
+        """Persist network settings and calibration in separate JSON files."""
+        calibration = {"active_id": "TC-01", "profiles": {"TC-01": {"points": [
+            {"measured": 0.0, "reference": 0.5},
+            {"measured": 100.0, "reference": 99.5},
+        ]}}}
         config = dict(web.DEFAULT_CONFIG, dhcp=False, ip="10.0.0.20",
                       netmask="255.255.255.0", gateway="10.0.0.1", dns="10.0.0.1",
                       mqtt_enabled=True, mqtt_server="broker.local", mqtt_topic="lab/temperature",
-                      mqtt_user="sensor", mqtt_password="secret")
+                      mqtt_user="sensor", mqtt_password="secret", calibration=calibration)
         expected = {
             "ip": {"dhcp": False, "address": "10.0.0.20", "netmask": "255.255.255.0",
                    "gateway": "10.0.0.1", "dns": "10.0.0.1"},
@@ -148,10 +253,13 @@ class ConfigTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(web, "CONFIG_FILE", os.path.join(directory, "config.json")):
-                web.save_config(config)
-                with open(web.CONFIG_FILE) as stream:
-                    self.assertEqual(json.load(stream), expected)
-                self.assertEqual(web.load_config(), config)
+                with patch.object(web, "CALIBRATION_FILE", os.path.join(directory, "calibration.json")):
+                    web.save_config(config)
+                    with open(web.CONFIG_FILE) as stream:
+                        self.assertEqual(json.load(stream), expected)
+                    with open(web.CALIBRATION_FILE) as stream:
+                        self.assertEqual(json.load(stream), calibration)
+                    self.assertEqual(web.load_config(), config)
 
     def test_bad_file_recovers_to_dhcp(self):
         """Corrupt configuration must not make the board permanently unreachable."""
@@ -166,20 +274,69 @@ class ConfigTests(unittest.TestCase):
         """Migrate old settings without discarding broker or other values."""
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(web, "CONFIG_FILE", os.path.join(directory, "config.json")):
-                legacy = web.DEFAULT_CONFIG.copy()
-                legacy.pop("mqtt_enabled", None)
-                legacy["mqtt_server"] = "broker.local"
-                with open(web.CONFIG_FILE, "w") as stream:
-                    json.dump(legacy, stream)
-                loaded = web.load_config()
-                self.assertTrue(loaded["mqtt_enabled"])
-                self.assertEqual(loaded["mqtt_server"], "broker.local")
-                legacy["mqtt_server"] = ""
-                with open(web.CONFIG_FILE, "w") as stream:
-                    json.dump(legacy, stream)
-                loaded = web.load_config()
+                with patch.object(web, "CALIBRATION_FILE", os.path.join(directory, "calibration.json")):
+                    legacy = web.DEFAULT_CONFIG.copy()
+                    legacy.pop("mqtt_enabled", None)
+                    legacy.pop("calibration", None)
+                    legacy["mqtt_server"] = "broker.local"
+                    with open(web.CONFIG_FILE, "w") as stream:
+                        json.dump(legacy, stream)
+                    loaded = web.load_config()
+                    self.assertTrue(loaded["mqtt_enabled"])
+                    self.assertEqual(loaded["mqtt_server"], "broker.local")
+                    legacy["mqtt_server"] = ""
+                    with open(web.CONFIG_FILE, "w") as stream:
+                        json.dump(legacy, stream)
+                    loaded = web.load_config()
         self.assertFalse(loaded["mqtt_enabled"])
         self.assertEqual(loaded["mqtt_topic"], legacy["mqtt_topic"])
+
+    def test_existing_grouped_config_without_calibration_migrates(self):
+        """Preserve the current IP/MQTT grouped format when calibration is absent."""
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(web, "CONFIG_FILE", os.path.join(directory, "config.json")):
+                old_grouped = {
+                    "ip": {"dhcp": True, "address": "192.168.1.20", "netmask": "255.255.255.0",
+                           "gateway": "192.168.1.1", "dns": "192.168.1.1"},
+                    "mqtt": {"enabled": False, "server": "", "port": 1883,
+                             "topic": "sensor/temperature", "user": "", "password": "", "interval": 5},
+                }
+                with open(web.CONFIG_FILE, "w") as stream:
+                    json.dump(old_grouped, stream)
+                with patch.object(web, "CALIBRATION_FILE", os.path.join(directory, "calibration.json")):
+                    loaded = web.load_config()
+        self.assertEqual(loaded["ip"], "192.168.1.20")
+        self.assertEqual(loaded["calibration"], {"active_id": "", "profiles": {}})
+
+    def test_embedded_calibration_migrates_to_calibration_file(self):
+        """Move calibration embedded in an older config.json to calibration.json."""
+        config = dict(web.DEFAULT_CONFIG, calibration={
+            "active_id": "TC-01",
+            "profiles": {"TC-01": {"points": [
+                {"measured": 0.0, "reference": 1.0},
+                {"measured": 100.0, "reference": 99.0},
+            ]}},
+        })
+        stored = {
+            "ip": {"dhcp": config["dhcp"], "address": config["ip"],
+                   "netmask": config["netmask"], "gateway": config["gateway"],
+                   "dns": config["dns"]},
+            "mqtt": {"enabled": config["mqtt_enabled"], "server": config["mqtt_server"],
+                     "port": config["mqtt_port"], "topic": config["mqtt_topic"],
+                     "user": config["mqtt_user"], "password": config["mqtt_password"],
+                     "interval": config["interval"]},
+            "calibration": config["calibration"],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(web, "CONFIG_FILE", os.path.join(directory, "config.json")):
+                with patch.object(web, "CALIBRATION_FILE", os.path.join(directory, "calibration.json")):
+                    with open(web.CONFIG_FILE, "w") as stream:
+                        json.dump(stored, stream)
+                    loaded = web.load_config()
+                    with open(web.CALIBRATION_FILE) as stream:
+                        migrated = json.load(stream)
+        self.assertEqual(loaded["calibration"], config["calibration"])
+        self.assertEqual(migrated, config["calibration"])
 
     def test_static_ip_and_validation(self):
         """Reject invalid subnets, host addresses, topics and numeric fields."""
@@ -203,11 +360,50 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(body=body), self.assertRaises(ValueError):
                 web.decode_form(body)
 
+    def test_calibration_form_saves_selected_profile_and_keeps_others(self):
+        """Save measured/reference pairs under one ID without removing other IDs."""
+        previous = dict(web.DEFAULT_CONFIG, calibration={
+            "active_id": "TC-OLD",
+            "profiles": {"TC-OLD": {"points": [
+                {"measured": 0.0, "reference": 1.0},
+                {"measured": 100.0, "reference": 99.0},
+            ]}},
+        })
+        fields = {name: str(value) for name, value in previous.items() if name != "calibration"}
+        fields.update(dhcp="yes", mqtt_enabled="no", mqtt_port="1883", interval="5",
+                      csrf="token", clear_password="no", mqtt_password="",
+                      calibration_profile="", calibration_new_id="Thermocouple 2",
+                      calibration_count="2")
+        for index in range(1, 11):
+            fields["calibration_measured_" + str(index)] = ""
+            fields["calibration_reference_" + str(index)] = ""
+        fields.update(calibration_measured_1="10.5", calibration_reference_1="11",
+                      calibration_measured_2="50", calibration_reference_2="49")
+        saved = web.form_config(fields, previous)["calibration"]
+        self.assertEqual(saved["active_id"], "Thermocouple 2")
+        self.assertEqual(saved["profiles"]["Thermocouple 2"]["points"], [
+            {"measured": 10.5, "reference": 11.0},
+            {"measured": 50.0, "reference": 49.0},
+        ])
+        self.assertIn("TC-OLD", saved["profiles"])
+        fields.update(calibration_profile="TC-OLD", calibration_new_id="",
+                      calibration_measured_1="0", calibration_reference_1="1",
+                      calibration_measured_2="100", calibration_reference_2="99")
+        selected = web.form_config(fields, dict(previous, calibration=saved))["calibration"]
+        self.assertEqual(selected["active_id"], "TC-OLD")
+        self.assertIn("Thermocouple 2", selected["profiles"])
+
     def test_password_preserve_replace_clear(self):
         """Blank password keeps the stored value; deletion is explicit."""
         previous = dict(web.DEFAULT_CONFIG, mqtt_password="secret")
-        fields = dict(previous, dhcp="yes", mqtt_enabled="yes", mqtt_port="1883", interval="5",
-                      csrf="token", clear_password="no", mqtt_password="")
+        fields = {name: str(value) for name, value in previous.items() if name != "calibration"}
+        fields.update(dhcp="yes", mqtt_enabled="yes", mqtt_port="1883", interval="5",
+                      csrf="token", clear_password="no", mqtt_password="",
+                      calibration_profile="", calibration_new_id="",
+                      calibration_count="2")
+        for index in range(1, 11):
+            fields["calibration_measured_" + str(index)] = ""
+            fields["calibration_reference_" + str(index)] = ""
         configured = web.form_config(fields, previous)
         self.assertEqual(configured["mqtt_password"], "secret")
         self.assertTrue(configured["mqtt_enabled"])
@@ -254,7 +450,8 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         self.server = web.ConfigServer(
             dict(web.DEFAULT_CONFIG, mqtt_password="DO_NOT_DISCLOSE"),
             lambda: {"ip": "192.168.1.20", "mac": "02:00:00:00:00:01",
-                     "temperature": 24.5, "mqtt": "Disconnected"},
+                     "temperature": 24.5, "mqtt": "Disconnected",
+                     "sensor_id": "TC-01", "calibration_applied": True},
             self.restart,
         )
 
@@ -277,8 +474,13 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
 
     def form(self, **changes):
         """Generate the full browser form using the server's current CSRF token."""
-        fields = dict(web.DEFAULT_CONFIG, dhcp="yes", mqtt_enabled="no", mqtt_password="",
-                      clear_password="no", csrf=self.server.csrf)
+        fields = {name: value for name, value in web.DEFAULT_CONFIG.items() if name != "calibration"}
+        fields.update(dhcp="yes", mqtt_enabled="no", mqtt_password="", clear_password="no",
+                      csrf=self.server.csrf, calibration_profile="", calibration_new_id="",
+                      calibration_count="2")
+        for index in range(1, 11):
+            fields["calibration_measured_" + str(index)] = ""
+            fields["calibration_reference_" + str(index)] = ""
         fields.update(changes)
         return urlencode(fields).encode()
 
@@ -301,16 +503,43 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
     async def test_page_and_temperature(self):
         """Serve an escaped form and keep the existing temperature API."""
         self.server.config["mqtt_user"] = '<script>alert("x")</script>'
+        self.server.config["calibration"] = {
+            "active_id": "TC-01",
+            "profiles": {
+                "TC-01": {"points": [
+                    {"measured": 0.0, "reference": 1.0},
+                    {"measured": 100.0, "reference": 99.0},
+                ]},
+                "TC-02": {"points": [
+                    {"measured": 0.0, "reference": 0.5},
+                    {"measured": 100.0, "reference": 99.5},
+                ]},
+            },
+        }
         headers, payload = await self.request()
         self.assertIn(b"200 OK", headers)
+        self.assertIn(b'href="#calibration"', payload)
+        self.assertIn(b'name="calibration_profile"', payload)
+        self.assertIn(b'name="calibration_new_id"', payload)
+        self.assertIn(b'<select id="calibration-profile" name="calibration_profile">', payload)
+        self.assertIn(b'<option value="">Create new profile...</option>', payload)
+        self.assertIn(b'<option value="TC-01" selected>TC-01</option>', payload)
+        self.assertIn(b'<option value="TC-02">TC-02</option>', payload)
+        self.assertIn(b'id="calibration-new-id-control" hidden', payload)
+        self.assertIn(b'name="calibration_count"', payload)
+        self.assertIn(b'value="100.0"', payload)
         self.assertIn(b'id="sensor-status"', payload)
         self.assertIn(b'id="temperature-reading"', payload)
+        self.assertIn(b'id="sensor-id"', payload)
+        self.assertIn(b"TC-01", payload)
+        self.assertIn(b'id="calibration-indicator"', payload)
+        self.assertIn(b"Calibrated</small>", payload)
         self.assertIn(b'href="/api/temperature"', payload)
         self.assertIn(b'>API</a>', payload)
         self.assertIn(b'target="_blank" rel="noopener noreferrer"', payload)
         self.assertIn("24.5 °C".encode("utf-8"), payload)
         self.assertIn(b"String(reading.temperature) + ' \xc2\xb0C'", payload)
-        self.assertIn(b"fetch('/api/temperature'", payload)
+        self.assertIn(b"fetch('/api/status'", payload)
         self.assertIn(b"setTimeout(refreshStatus, 1000)", payload)
         self.assertIn(b"form.requestSubmit()", payload)
         self.assertIn(b'nonce="' + self.server.page_nonce.encode() + b'"', payload)
@@ -323,7 +552,8 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"&lt;script&gt;", payload)
         self.assertNotIn(b"<script>", payload)
         status_order = [payload.index(label) for label in (
-            b"MAC address", b"IP address", b"MQTT status", b"Sensor status", b"Temperature")]
+            b"MAC address", b"IP address", b"MQTT status", b"Sensor ID",
+            b"Sensor status", b"Temperature")]
         self.assertEqual(status_order, sorted(status_order))
         self.server.config.update(dhcp=False, mqtt_enabled=True)
         headers, payload = await self.request()
@@ -331,7 +561,10 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b'id="mqtt-on" name="mqtt_enabled" value="yes" checked', payload)
         headers, payload = await self.request(path="/api/temperature")
         self.assertIn(b"200 OK", headers)
-        self.assertEqual(json.loads(payload), {"temperature": 24.5, "unit": "\u00b0C", "sensor": "OK"})
+        self.assertEqual(json.loads(payload), {
+            "temperature": 24.5, "unit": "\u00b0C", "sensor": "OK",
+            "sensor_id": "TC-01", "calibrated": True, "raw_temperature": 24.5,
+        })
 
     async def test_mqtt_status_is_omitted_when_disabled(self):
         """Keep the temperature at the final status column without MQTT."""
@@ -342,8 +575,55 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         _, payload = await self.request()
         self.assertNotIn(b"MQTT status", payload)
         self.assertIn(b'<section class="status"', payload)
-        self.assertIn(b".status:not(.with-mqtt){grid-template-columns:repeat(4,minmax(0,1fr))}", payload)
+        self.assertIn(b".status:not(.with-mqtt){grid-template-columns:repeat(5,minmax(0,1fr))}", payload)
         self.assertIn(b".status,.status:not(.with-mqtt){grid-template-columns:1fr", payload)
+
+    async def test_status_api_includes_calibration_metadata(self):
+        """Expose ID and applied state separately from the stable temperature API."""
+        self.server.status = Mock(return_value={
+            "ip": "192.168.1.20", "mac": "02:00:00:00:00:01", "temperature": 24.0,
+            "sensor": "OK", "mqtt": "Disabled", "mqtt_enabled": False,
+            "sensor_id": "TC-01", "calibration_applied": True,
+        })
+        _, payload = await self.request(path="/api/status")
+        self.assertEqual(json.loads(payload), {
+            "temperature": 24.0, "unit": "\u00b0C", "sensor": "OK",
+            "sensor_id": "TC-01", "calibrated": True, "raw_temperature": 24.0,
+        })
+
+    async def test_calibration_api_lists_upserts_and_activates_profiles(self):
+        """Read all profiles, add another, then switch the active profile via API."""
+        existing = {"active_id": "TC-01", "profiles": {"TC-01": {"points": [
+            {"measured": 0.0, "reference": 1.0},
+            {"measured": 100.0, "reference": 99.0},
+        ]}}}
+        self.server.config["calibration"] = existing
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(web, "CONFIG_FILE", os.path.join(directory, "config.json")):
+                with patch.object(web, "CALIBRATION_FILE", os.path.join(directory, "calibration.json")):
+                    _, payload = await self.request(path="/api/calibration")
+                    self.assertEqual(json.loads(payload), existing)
+                    body = json.dumps({"sensor_id": "Thermocouple 2", "points": [
+                        {"measured": 10.0, "reference": 11.0},
+                        {"measured": 90.0, "reference": 89.0},
+                    ]}).encode()
+                    headers, payload = await self.request(
+                        "POST", "/api/calibration", body,
+                        extra="Content-Type: application/json\r\n")
+                    self.assertIn(b"200 OK", headers)
+                    created = json.loads(payload)
+                    self.assertEqual(created["active_id"], "Thermocouple 2")
+                    self.assertIn("TC-01", created["profiles"])
+                    with open(web.CALIBRATION_FILE) as stream:
+                        self.assertEqual(json.load(stream), created)
+                    body = json.dumps({"sensor_id": "TC-01"}).encode()
+                    headers, payload = await self.request(
+                        "POST", "/api/calibration", body,
+                        extra="Content-Type: application/json\r\n")
+                    self.assertIn(b"200 OK", headers, payload.decode("utf-8"))
+        activated = json.loads(payload)
+        self.assertEqual(activated["active_id"], "TC-01")
+        self.assertIn("Thermocouple 2", activated["profiles"])
 
     async def test_page_accepts_legacy_config_without_mqtt_enabled(self):
         """Infer the previous MQTT state when rendering an older config object."""
@@ -353,7 +633,7 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b'id="mqtt-on" name="mqtt_enabled" value="yes" checked', payload)
 
     async def test_mqtt_and_api_have_identical_temperature_json(self):
-        """Compare a real publisher call with the API response for the same reading."""
+        """Keep MQTT and both temperature API routes byte-for-byte equivalent."""
         with patch.dict(sys.modules, {"machine": types.SimpleNamespace(), "network": types.SimpleNamespace()}):
             namespace = runpy.run_path(os.path.join(os.path.dirname(__file__), "main.py"))
         device_class = namespace["Device"]
@@ -371,13 +651,15 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
             for temperature in (24.5, -12.75, 0):
                 with self.subTest(temperature=temperature):
                     device.temperature = temperature
+                    device.raw_temperature = temperature
                     device.last_publish = 0
                     device.sensor_status = "OK"
                     self.server.status = Mock(return_value={"temperature": temperature, "sensor": "OK"})
                     device.step()
                     _, payload = await self.request(path="/api/temperature")
                     self.assertEqual(client.publish.call_args.args[1], payload)
-                    self.assertEqual(json.loads(payload), {"temperature": temperature, "unit": "\u00b0C", "sensor": "OK"})
+                    _, status_payload = await self.request(path="/api/status")
+                    self.assertEqual(status_payload, payload)
 
     async def test_temperature_api_preserves_null_on_sensor_fault(self):
         """Keep the unit present when no valid measurement is available."""
@@ -385,7 +667,9 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
                                                                                                 "sensor": "Thermocouple open/not connected"})
         _, payload = await self.request(path="/api/temperature")
         self.assertEqual(json.loads(payload), {"temperature": None, "unit": "\u00b0C",
-                                                                                                    "sensor": "Thermocouple open/not connected"})
+                                                "sensor": "Thermocouple open/not connected",
+                                                "sensor_id": "", "calibrated": False,
+                                                "raw_temperature": None})
 
     async def test_csrf_and_invalid_form_do_not_write(self):
         """Reject foreign requests and invalid ports before touching flash."""
@@ -404,17 +688,44 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
     async def test_save_once_and_restart(self):
         """Persist validated settings before scheduling exactly one reboot."""
         with patch.object(web, "save_config") as save:
-            headers, _ = await self.request("POST", "/save", self.form(mqtt_server="broker.local"),
+            headers, _ = await self.request("POST", "/save", self.form(
+                mqtt_server="broker.local", calibration_profile="",
+                calibration_new_id="TC-02", calibration_count="2",
+                calibration_measured_1="0", calibration_reference_1="1",
+                calibration_measured_2="100", calibration_reference_2="99"),
                                             extra="Content-Type: application/x-www-form-urlencoded\r\n")
             self.assertIn(b"200 OK", headers)
             self.assertEqual(save.call_args.args[0]["mqtt_password"], "DO_NOT_DISCLOSE")
             self.assertFalse(save.call_args.args[0]["mqtt_enabled"])
             self.assertEqual(save.call_args.args[0]["mqtt_server"], "broker.local")
+            self.assertEqual(save.call_args.args[0]["calibration"]["active_id"], "TC-02")
+            self.assertIn("TC-02", save.call_args.args[0]["calibration"]["profiles"])
             self.restart.assert_called_once()
             headers, _ = await self.request("POST", "/save", self.form(),
                                             extra="Content-Type: application/x-www-form-urlencoded\r\n")
             self.assertIn(b"409 Conflict", headers)
             save.assert_called_once()
+
+    async def test_http_calibration_save_creates_calibration_json(self):
+        """Persist a newly submitted profile in the dedicated calibration file."""
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "config.json")
+            calibration_path = os.path.join(directory, "calibration.json")
+            with patch.object(web, "CONFIG_FILE", config_path):
+                with patch.object(web, "CALIBRATION_FILE", calibration_path):
+                    headers, _ = await self.request("POST", "/save", self.form(
+                        calibration_profile="", calibration_new_id="TC-03",
+                        calibration_count="2",
+                        calibration_measured_1="0", calibration_reference_1="1",
+                        calibration_measured_2="100", calibration_reference_2="99"),
+                        extra="Content-Type: application/x-www-form-urlencoded\r\n")
+                    self.assertIn(b"200 OK", headers)
+                    with open(calibration_path) as stream:
+                        calibration = json.load(stream)
+                    loaded = web.load_config()
+        self.assertEqual(calibration["active_id"], "TC-03")
+        self.assertEqual(len(calibration["profiles"]), 1)
+        self.assertEqual(loaded["calibration"], calibration)
 
     async def test_malformed_request_does_not_leak_config(self):
         """Malformed headers must receive a bounded error without settings data."""

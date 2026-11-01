@@ -27,7 +27,7 @@ class MAX31855:
         if raw & 0x8008:
             return None, "Invalid data frame (check wiring/clock)"
 
-        # Fehlerbits prüfen (Bit 0: OC, Bit 1: SCG, Bit 2: SCV)
+        # Fehlerbits pruefen (Bit 0: OC, Bit 1: SCG, Bit 2: SCV)
         if raw & 0x7:
             faults = [name for bit, name in ((1, "Thermocouple open/not connected"),
                                              (2, "Thermocouple short to GND"),

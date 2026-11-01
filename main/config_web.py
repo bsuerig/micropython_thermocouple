@@ -34,6 +34,10 @@ def temperature_json(temperature, sensor="OK", sensor_id="", calibrated=False,
     """Serialize identical MQTT and HTTP temperature data with calibration metadata."""
     if raw_temperature is None and temperature is not None and not calibrated:
         raw_temperature = temperature
+    if temperature is not None:
+        temperature = round(float(temperature), 1)
+    if raw_temperature is not None:
+        raw_temperature = round(float(raw_temperature), 1)
     return json.dumps({
         "temperature": temperature,
         "unit": "\u00b0C",
@@ -361,12 +365,13 @@ input,select{display:block;width:100%;height:48px;margin-top:.45rem;padding:.65r
 <label>Stored password<select name="clear_password"><option value="no">Keep</option><option value="yes">Clear</option></select></label>
 </div></div></fieldset><div class="actions"><button type="submit">Save and reboot</button></div></form><p class="footer">ESP32-P4-ETH / MAX31855</p><script nonce="@page_nonce@">
 const form = document.querySelector('form');
-const calibrationProfiles = @calibration_profiles@;
+let calibrationProfiles = @calibration_profiles@;
 const calibrationProfile = document.getElementById('calibration-profile');
 const calibrationNewId = document.getElementById('calibration-new-id');
 const calibrationNewIdControl = document.getElementById('calibration-new-id-control');
 const calibrationCount = document.getElementById('calibration-count');
 let polling = false;
+let calibrationFormEdited = false;
 let submitting = false;
 let submitQueued = false;
 function updateCalibrationRows() {
@@ -397,6 +402,7 @@ function loadCalibrationProfile() {
     updateCalibrationRows();
 }
 function updateNewCalibrationId() {
+    calibrationFormEdited = true;
     if (calibrationProfile.value) {
         calibrationProfile.value = '';
         calibrationCount.value = 2;
@@ -407,9 +413,20 @@ function updateNewCalibrationId() {
     calibrationNewIdControl.hidden = false;
     updateCalibrationRows();
 }
-calibrationProfile.addEventListener('change', loadCalibrationProfile);
+calibrationProfile.addEventListener('change', function() {
+    calibrationFormEdited = true;
+    loadCalibrationProfile();
+});
 calibrationNewId.addEventListener('input', updateNewCalibrationId);
-calibrationCount.addEventListener('input', updateCalibrationRows);
+calibrationCount.addEventListener('input', function() {
+    calibrationFormEdited = true;
+    updateCalibrationRows();
+});
+document.querySelectorAll('.calibration-point input').forEach(function(input) {
+    input.addEventListener('input', function() {
+        calibrationFormEdited = true;
+    });
+});
 loadCalibrationProfile();
 form.addEventListener('submit', function(event) {
     submitting = true;
@@ -429,8 +446,30 @@ async function refreshStatus() {
             document.getElementById('sensor-status').textContent = reading.sensor
                 || (reading.temperature === null ? 'Sensor error' : 'OK');
             document.getElementById('temperature-reading').textContent =
-                reading.temperature === null ? '--' : String(reading.temperature) + ' \u00b0C';
+                reading.temperature === null ? '--' : reading.temperature.toFixed(1) + ' \u00b0C';
             document.getElementById('calibration-indicator').hidden = !reading.calibrated;
+        }
+    } catch (error) {}
+    try {
+        const response = await fetch('/api/calibration', {cache: 'no-store'});
+        if (response.ok) {
+            const calibration = await response.json();
+            const previousSelection = calibrationProfile.value;
+            calibrationProfiles = calibration.profiles;
+            while (calibrationProfile.firstChild) {
+                calibrationProfile.removeChild(calibrationProfile.firstChild);
+            }
+            calibrationProfile.add(new Option('Create new profile...', ''));
+            Object.keys(calibrationProfiles).sort().forEach(function(profileId) {
+                calibrationProfile.add(new Option(profileId, profileId));
+            });
+            const selectedProfile = calibrationFormEdited
+                ? previousSelection : calibration.active_id;
+            calibrationProfile.value = calibrationProfiles[selectedProfile]
+                ? selectedProfile : '';
+            if (!calibrationFormEdited && calibrationProfile.value !== previousSelection) {
+                loadCalibrationProfile();
+            }
         }
     } catch (error) {}
     polling = false;
@@ -472,7 +511,7 @@ class ConfigServer:
             "status_class": "status with-mqtt" if mqtt_enabled else "status",
             "address": values["ip"],
             "mac": values.get("mac", "--"),
-            "temperature": str(values["temperature"]) + " \u00b0C" if values["temperature"] is not None else "--",
+            "temperature": "%.1f \u00b0C" % values["temperature"] if values["temperature"] is not None else "--",
             "sensor_id": values.get("sensor_id") or "--",
             "calibration_visibility": "" if values.get("calibration_applied", False) else "hidden",
             "sensor": values.get("sensor", "OK" if values["temperature"] is not None else "Sensor error"),

@@ -451,7 +451,7 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         self.server = web.ConfigServer(
             dict(web.DEFAULT_CONFIG, mqtt_password="DO_NOT_DISCLOSE"),
             lambda: {"ip": "192.168.1.20", "mac": "02:00:00:00:00:01",
-                     "temperature": 24.5, "mqtt": "Disconnected",
+                     "temperature": 24.56, "mqtt": "Disconnected",
                      "sensor_id": "TC-01", "calibration_applied": True},
             self.restart,
         )
@@ -538,9 +538,12 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b'href="/api/temperature"', payload)
         self.assertIn(b'>API</a>', payload)
         self.assertIn(b'target="_blank" rel="noopener noreferrer"', payload)
-        self.assertIn("24.5 \u00b0C".encode("utf-8"), payload)
-        self.assertIn(b"String(reading.temperature) + ' \xc2\xb0C'", payload)
+        self.assertIn("24.6 \u00b0C".encode("utf-8"), payload)
+        self.assertIn(b"reading.temperature.toFixed(1) + ' \xc2\xb0C'", payload)
         self.assertIn(b"fetch('/api/status'", payload)
+        self.assertIn(b"fetch('/api/calibration'", payload)
+        self.assertIn(b"calibrationProfile.add(new Option(profileId, profileId))", payload)
+        self.assertIn(b"calibrationFormEdited", payload)
         self.assertIn(b"setTimeout(refreshStatus, 1000)", payload)
         self.assertIn(b"form.requestSubmit()", payload)
         self.assertIn(b'nonce="' + self.server.page_nonce.encode() + b'"', payload)
@@ -563,8 +566,8 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         headers, payload = await self.request(path="/api/temperature")
         self.assertIn(b"200 OK", headers)
         self.assertEqual(json.loads(payload), {
-            "temperature": 24.5, "unit": "\u00b0C", "sensor": "OK",
-            "sensor_id": "TC-01", "calibrated": True, "raw_temperature": 24.5,
+            "temperature": 24.6, "unit": "\u00b0C", "sensor": "OK",
+            "sensor_id": "TC-01", "calibrated": True, "raw_temperature": 24.6,
         })
 
     async def test_mqtt_status_is_omitted_when_disabled(self):
@@ -649,16 +652,28 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
             client = Mock()
             device.client = client
             device.last_sample = clock.ticks_ms()
-            for temperature in (24.5, -12.75, 0):
+            for temperature, raw_temperature in (
+                    (24.5, 24.5), (-12.75, -12.75), (0, 0), (24.56, 25.04)):
                 with self.subTest(temperature=temperature):
                     device.temperature = temperature
-                    device.raw_temperature = temperature
+                    device.raw_temperature = raw_temperature
                     device.last_publish = 0
                     device.sensor_status = "OK"
-                    self.server.status = Mock(return_value={"temperature": temperature, "sensor": "OK"})
+                    self.server.status = Mock(return_value={
+                        "temperature": temperature, "raw_temperature": raw_temperature,
+                        "sensor": "OK"})
                     device.step()
                     _, payload = await self.request(path="/api/temperature")
                     self.assertEqual(client.publish.call_args.args[1], payload)
+                    result = json.loads(payload)
+                    self.assertEqual(result["temperature"], round(float(temperature), 1))
+                    self.assertEqual(result["raw_temperature"], round(float(raw_temperature), 1))
+                    self.assertIn(
+                        ('"temperature": %.1f' % round(float(temperature), 1)).encode(),
+                        payload)
+                    self.assertIn(
+                        ('"raw_temperature": %.1f' % round(float(raw_temperature), 1)).encode(),
+                        payload)
                     _, status_payload = await self.request(path="/api/status")
                     self.assertEqual(status_payload, payload)
 

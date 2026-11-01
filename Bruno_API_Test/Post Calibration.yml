@@ -1,0 +1,31 @@
+info:
+  name: Post Calibration
+  type: http
+  seq: 1
+
+http:
+  method: POST
+  url: "{{baseUrl}}/api/calibration"
+  body:
+    type: json
+    data: |
+      {
+          "sensor_id": "Thermocouple 1", 
+            "points": [
+              {
+                "reference": 0.0,
+                "measured": 2.0
+              },
+              {
+                "reference": 100.0,
+                "measured": 98.0
+              }
+            ]
+          }
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: true
+  maxRedirects: 5

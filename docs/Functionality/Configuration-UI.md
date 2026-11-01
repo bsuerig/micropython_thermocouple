@@ -152,7 +152,7 @@ This specification covers the Ethernet address-mode and MQTT enable controls on 
 - `priority: must`
 - `source: user`
 - `status: approved`
-- The status row shall display the temperature in degrees Celsius using the `°C` unit. It shall provide a visible `API` link to `GET /api/temperature` that opens in a new tab.
+- The status row shall display the temperature in degrees Celsius using the `°C` unit, always with one decimal place. The numeric `temperature` and `raw_temperature` fields emitted by MQTT, `GET /api/temperature`, and `GET /api/status` shall be rounded to one decimal place. It shall provide a visible `API` link to `GET /api/temperature` that opens in a new tab.
 
 **Verification contract**
 

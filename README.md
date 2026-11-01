@@ -82,11 +82,12 @@ Ethernet-Konfigurationsseite und MQTT-Temperaturversand.
    Alte flache Netzwerkeinstellungen werden beim Laden uebernommen und beim
    naechsten Speichern gruppiert geschrieben. Bereits in `config.json` gespeicherte
    Kalibrierprofile werden beim Start nach `calibration.json` migriert.
-- Die Startseite zeigt MAC-Adresse, IP-Adresse, optionalen MQTT-Status,
+- Die Startseite zeigt MAC-Adresse, IP-Adresse, optionalen MQTT-Status; angezeigte und ausgegebene Temperaturen haben stets eine Nachkommastelle.
   Sensor-ID, Sensor-Status und Temperatur in dieser Reihenfolge. Der Status
   **Calibrated** erscheint nur, wenn die Korrektur den Temperaturwert verändert.
-   Status und Temperatur werden sekündlich aktualisiert. MQTT, `GET /api/temperature`
-   und `GET /api/status` liefern dasselbe JSON mit kalibrierter und roher Temperatur:
+   Status, Temperatur und Kalibrierprofile werden sekündlich aktualisiert; neue
+   oder per API aktivierte Profile erscheinen ohne Neuladen in der Auswahl.
+   MQTT, `GET /api/temperature` und `GET /api/status` liefern dasselbe JSON mit kalibrierter und roher Temperatur:
    `{"temperature":24.5,"unit":"\u00b0C","sensor":"OK","sensor_id":"TC-02","calibrated":true,"raw_temperature":25.0}`.
 - Calibration API: `GET /api/calibration` returns all profiles and the active ID.
    `POST /api/calibration` accepts JSON to create/update and activate a profile:
